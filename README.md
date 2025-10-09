@@ -3,7 +3,7 @@
 <div align="center">
   <img src="public/og.jpeg" alt="Mechaverse - Universal 3D Robot Viewer" width="800" style="border-radius: 12px; margin: 20px 0;">
   <div style="display: flex; justify-content: center; gap: 12px; margin: 5px 0;">
-    <a href="https://mechaverse.dev">
+    <a href="https://render.mechaverse.dev">
       <img src="https://img.shields.io/badge/Demo-mechaverse.dev-blue?style=for-the-badge&logo=globe" alt="Demo">
     </a>
     <a href="https://discord.gg/UDYNE7qRVb">
@@ -45,7 +45,7 @@ Here we use **bun** but you can also use **npm** or **yarn**
 <div align="center">
   <p>Made with ❤️ and 🥭</p>
   <p>
-    <a href="https://mechaverse.dev">🌐 Live Demo</a> •
+    <a href="https://render.mechaverse.dev">🌐 Live Demo</a> •
     <a href="https://discord.gg/UDYNE7qRVb">💬 Discord</a> •
     <a href="https://github.com/jurmy24/mechaverse">📦 GitHub</a>
   </p>
