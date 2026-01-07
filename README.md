@@ -1,8 +1,10 @@
-# Mechaverse
+# FAXURDF
 
 <div align="center">
   <img src="public/og.jpeg" alt="Mechaverse - Universal 3D Robot Viewer" width="800" style="border-radius: 12px; margin: 20px 0;">
   <div style="display: flex; justify-content: center; gap: 12px; margin: 5px 0;">
+    ![Uploading 예시.gif…]()
+
     <a href="https://render.mechaverse.dev">
       <img src="https://img.shields.io/badge/Demo-mechaverse.dev-blue?style=for-the-badge&logo=globe" alt="Demo">
     </a>
