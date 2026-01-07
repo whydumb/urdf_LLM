@@ -266,3 +266,94 @@ export function setupJointLimits(
     loadAndParseUrdf();
   });
 }
+
+// ============================================================================
+// Joint Motion Functions
+// ============================================================================
+
+export type ViewerJointMotion = {
+  joint: string;
+  angle: number;
+  time?: number;
+  speed?: number;
+};
+
+type ApplyMotionsOptions = {
+  animate?: boolean;
+  defaultDurationMs?: number;
+  assumeDegrees?: boolean;
+  jointNameMap?: Record<string, string>;
+};
+
+const TWO_PI = Math.PI * 2;
+
+function toRadiansIfNeeded(angle: number, assumeDegrees?: boolean) {
+  if (assumeDegrees) return (angle * Math.PI) / 180;
+  if (Math.abs(angle) > TWO_PI + 1e-3) return (angle * Math.PI) / 180;
+  return angle;
+}
+
+function getCurrentJointValue(viewer: URDFViewerElement, jointName: string): number {
+  const robot: any = (viewer as any).robot;
+  const j = robot?.joints?.[jointName];
+  const v = j?.jointValue ?? j?.angle ?? j?.value ?? undefined;
+  return typeof v === "number" ? v : 0;
+}
+
+export function applyJointMotionsToViewer(
+  viewer: URDFViewerElement,
+  motions: ViewerJointMotion[],
+  opts: ApplyMotionsOptions = {}
+) {
+  if (!viewer) return;
+  if (typeof (viewer as any).setJointValue !== "function") return;
+  if (!motions?.length) return;
+
+  const anyViewer = viewer as any;
+
+  if (anyViewer.__motionRafId) {
+    cancelAnimationFrame(anyViewer.__motionRafId);
+    anyViewer.__motionRafId = null;
+  }
+
+  const animate = opts.animate ?? true;
+  const defaultDurationMs = opts.defaultDurationMs ?? 350;
+  const jointNameMap = opts.jointNameMap ?? {};
+
+  const items = motions.map((m) => {
+    const joint = jointNameMap[m.joint] ?? m.joint;
+    const to = toRadiansIfNeeded(m.angle, opts.assumeDegrees);
+    const from = getCurrentJointValue(viewer, joint);
+    const durationMs =
+      typeof m.time === "number" && m.time > 0 ? m.time * 1000 : defaultDurationMs;
+    return { joint, from, to, durationMs };
+  });
+
+  if (!animate) {
+    for (const it of items) {
+      (viewer as any).setJointValue(it.joint, it.to);
+    }
+    viewer.redraw?.();
+    return;
+  }
+
+  const start = performance.now();
+
+  const tick = (now: number) => {
+    let anyRunning = false;
+    for (const it of items) {
+      const t = Math.min(1, (now - start) / it.durationMs);
+      const value = it.from + (it.to - it.from) * t;
+      (viewer as any).setJointValue(it.joint, value);
+      if (t < 1) anyRunning = true;
+    }
+    viewer.redraw?.();
+    if (anyRunning) {
+      anyViewer.__motionRafId = requestAnimationFrame(tick);
+    } else {
+      anyViewer.__motionRafId = null;
+    }
+  };
+
+  anyViewer.__motionRafId = requestAnimationFrame(tick);
+}
