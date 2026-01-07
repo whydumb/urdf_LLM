@@ -1,0 +1,19 @@
+@import "tailwindcss";
+@plugin "tailwind-scrollbar";
+
+/* Theme tokens (Tailwind v4) */
+@theme inline {
+  /* Viewer-specific tokens used by JS and CSS */
+  --mujoco-scene-bg: #FCF4DD;
+
+  /* Tailwind color tokens consumed via bg-*, text-*, etc. */
+  --color-background: #FCF4DD;
+  --color-foreground: #968612;
+  --color-brand: #968812;
+  --color-highlight: #FBE651;
+
+  /* Fonts wired to next/font variable */
+  --font-mono: var(--font-dm-mono);
+  --font-sans: var(--font-mono);
+}
+
