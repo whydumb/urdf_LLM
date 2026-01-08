@@ -1,22 +1,5 @@
 # FAXURDF
 
-<div align="center">
-  <img src="public/og.jpeg" alt="Mechaverse - Universal 3D Robot Viewer" width="800" style="border-radius: 12px; margin: 20px 0;">
-  <div style="display: flex; justify-content: center; gap: 12px; margin: 5px 0;">
-    ![Uploading 예시.gif…]()
-
-    <a href="https://render.mechaverse.dev">
-      <img src="https://img.shields.io/badge/Demo-mechaverse.dev-blue?style=for-the-badge&logo=globe" alt="Demo">
-    </a>
-    <a href="https://discord.gg/UDYNE7qRVb">
-      <img src="https://img.shields.io/badge/Discord-Join-7289DA?style=for-the-badge&logo=discord" alt="Discord">
-    </a>
-    <a href="LICENSE">
-      <img src="https://img.shields.io/badge/License-MIT-green.svg?style=for-the-badge" alt="License">
-    </a>
-  </div>
-</div>
-
 **Mechaverse** is a universal 3D viewer for robot models and scenes. We currently support **URDF**, **MJCF**, and **OpenUSD** formats right in the browser. It looks best on the computer, where you can drag, drop, and inspect your robot models without any setup or installation required. However, we also support smaller screens but can't make any promises in rendering quality.
 
 It's a simple **Next.js** project, where rendering is supported by Three.js. We designed the viewer as a dispatch service making use of some great work by other open-source projects like:
@@ -44,11 +27,4 @@ Here we use **bun** but you can also use **npm** or **yarn**
 
 ---
 
-<div align="center">
-  <p>Made with ❤️ and 🥭</p>
-  <p>
-    <a href="https://render.mechaverse.dev">🌐 Live Demo</a> •
-    <a href="https://discord.gg/UDYNE7qRVb">💬 Discord</a> •
-    <a href="https://github.com/jurmy24/mechaverse">📦 GitHub</a>
-  </p>
-</div>
+
