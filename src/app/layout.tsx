@@ -15,11 +15,11 @@ export const metadata: Metadata = {
   description:
     "Upload and view your MJCF, URDF, and USD robots and environments in a 3D environment.",
   openGraph: {
-    title: "Mechaverse",
+    title: "Fax",
     description:
       "Upload and view your MJCF, URDF, and USD robots and environments in a 3D environment.",
     url: "https://mechaverse.dev",
-    siteName: "Mechaverse",
+    siteName: "Fax",
     images: [
       { url: "https://mechaverse.dev/og.jpeg", width: 4518, height: 2567 },
     ],
