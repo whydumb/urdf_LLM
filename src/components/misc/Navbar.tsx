@@ -133,7 +133,7 @@ export default function Navbar() {
       {/* Desktop: Right-side links */}
       <div className="ml-auto hidden md:flex items-center gap-6">
         <a
-          href="https://github.com/jurmy24/mechaverse"
+          href="https://github.com/whydumb/urdf_LLM"
           target="_blank"
           rel="noopener noreferrer"
           className="hover:-translate-y-1 transition-transform flex items-center gap-2 group"
@@ -152,7 +152,7 @@ export default function Navbar() {
           </span>
         </a>
         <a
-          href="https://discord.gg/UDYNE7qRVb"
+          href="https://discord.gg/JqpfXxS4j"
           target="_blank"
           rel="noopener noreferrer"
           className="hover:-translate-y-1 transition-transform flex items-center gap-2 group"
