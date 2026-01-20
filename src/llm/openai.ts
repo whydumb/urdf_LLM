@@ -1,42 +1,39 @@
-import { existsSync, readFileSync } from "node:fs";
-import { resolve } from "node:path";
+// src/llm/openai.ts
 import OpenAI from "openai";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 
 import { strictFormat, type ChatTurn } from "./utils";
 
-const KEYS_PATH = resolve(process.cwd(), "keys.json");
-
-let keys: Record<string, string> = {};
-try {
-  if (existsSync(KEYS_PATH)) {
-    const data = readFileSync(KEYS_PATH, "utf8");
-    keys = JSON.parse(data);
-  } else {
-    console.warn("keys.json not found. Defaulting to environment variables.");
-  }
-} catch {
-  console.warn("Failed to read/parse keys.json. Defaulting to environment variables.");
-}
+/**
+ * keys.json 완전 폐기:
+ * - 키/설정은 무조건 process.env에서만 읽는다.
+ */
 
 export function getKey(name: string): string {
-  const key = keys?.[name] ?? process.env?.[name];
-  if (!key) {
-    throw new Error(`API key "${name}" not found in keys.json or environment variables!`);
+  const value = process.env?.[name];
+  if (!value || !value.trim()) {
+    // 에러 메시지에 OPENAI_API_KEY 같은 변수명이 반드시 포함되게 해서,
+    // 라우트 쪽에서 감지하기 쉽게 만든다.
+    throw new Error(`Missing required environment variable: ${name}`);
   }
-  return key;
+  return value.trim();
 }
 
 export function hasKey(name: string): boolean {
-  return Boolean(keys?.[name] || process.env?.[name]);
+  const value = process.env?.[name];
+  return Boolean(value && value.trim());
 }
 
 function createOpenAIClient(baseURL?: string) {
   const config: OpenAI.ClientOptions = {};
 
   if (baseURL) config.baseURL = baseURL;
-  if (hasKey("OPENAI_ORG_ID")) config.organization = getKey("OPENAI_ORG_ID");
 
+  // 조직/프로젝트(선택)
+  if (hasKey("OPENAI_ORG_ID")) config.organization = getKey("OPENAI_ORG_ID");
+  if (hasKey("OPENAI_PROJECT_ID")) config.project = getKey("OPENAI_PROJECT_ID");
+
+  // API 키(필수)
   config.apiKey = getKey("OPENAI_API_KEY");
 
   return new OpenAI(config);
@@ -102,9 +99,7 @@ export class GPT {
     stopSeq = "***",
   ): Promise<string> {
     const formatted = strictFormat(turns);
-    const apiMessages: ChatCompletionMessageParam[] = [
-      { role: "system", content: systemMessage },
-    ];
+    const apiMessages: ChatCompletionMessageParam[] = [{ role: "system", content: systemMessage }];
 
     formatted.forEach((turn, index) => {
       const isLast = index === formatted.length - 1;
@@ -115,10 +110,7 @@ export class GPT {
           role: turn.role,
           content: [
             { type: "text", text: `${turn.content}${stopSeq}` },
-            {
-              type: "image_url",
-              image_url: { url: `data:image/jpeg;base64,${base64Image}` },
-            },
+            { type: "image_url", image_url: { url: `data:image/jpeg;base64,${base64Image}` } },
           ],
         });
       } else {
@@ -138,9 +130,8 @@ export class GPT {
 
       let result = response.choices?.[0]?.message?.content ?? "";
       const index = result.indexOf(stopSeq);
-      if (index !== -1) {
-        result = result.slice(0, index);
-      }
+      if (index !== -1) result = result.slice(0, index);
+
       return result.trim();
     } catch (error: unknown) {
       console.error("[GPT Error]", error);
@@ -185,11 +176,7 @@ const sendAudioRequest = async (
   voice: string,
   baseUrl?: string,
 ): Promise<string> => {
-  const payload = {
-    model,
-    voice,
-    input: text,
-  } as const;
+  const payload = { model, voice, input: text } as const;
 
   const openai = createOpenAIClient(baseUrl);
 
