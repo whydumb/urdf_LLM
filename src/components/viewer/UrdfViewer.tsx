@@ -1,4 +1,6 @@
+// src/components/viewer/UrdfViewer.tsx
 "use client";
+
 import React, { useEffect, useRef, useState, useMemo } from "react";
 import { cn } from "@/lib/utils";
 
@@ -20,32 +22,26 @@ let registrationPromise: Promise<void> | null = null;
 
 const registerUrdfManipulator = async (): Promise<void> => {
   if (typeof window === "undefined") return;
-  if (customElements.get("urdf-viewer")) return; // Already registered
+  if (customElements.get("urdf-viewer")) return;
 
   if (!registrationPromise) {
     registrationPromise = (async () => {
       try {
-        const urdfModule = await import(
-          "urdf-loader/src/urdf-manipulator-element.js"
-        );
+        const urdfModule = await import("urdf-loader/src/urdf-manipulator-element.js");
         const UrdfManipulatorElement = urdfModule.default;
 
-        // Double-check to avoid define clashes in concurrent calls
         if (!customElements.get("urdf-viewer")) {
           try {
             customElements.define("urdf-viewer", UrdfManipulatorElement);
           } catch (defineError) {
-            // Swallow duplicate-definition errors from races
             const name = (defineError as { name?: string })?.name;
             const message = (defineError as Error)?.message || "";
             const isDuplicate =
-              name === "NotSupportedError" ||
-              message.includes("has already been used");
+              name === "NotSupportedError" || message.includes("has already been used");
             if (!isDuplicate) throw defineError;
           }
         }
       } catch (e) {
-        // Reset promise on hard failures so future attempts can retry
         registrationPromise = null;
         throw e;
       }
@@ -54,6 +50,246 @@ const registerUrdfManipulator = async (): Promise<void> => {
 
   return registrationPromise;
 };
+
+// ============================================================================
+// Motion Types & Helper Functions
+// ============================================================================
+type MoveJointMotion = { joint: string; angle: number; time?: number; speed?: number };
+type MoveJointsOptions = {
+  animate?: boolean;
+  defaultDurationMs?: number;
+  assumeDegrees?: boolean;
+  jointNameMap?: Record<string, string>;
+};
+type MoveJointsDetail = { motions: MoveJointMotion[]; options?: MoveJointsOptions };
+
+type JointLimits = Record<string, { lower?: number; upper?: number }>;
+type UrdfMeta = { availableJoints: string[]; jointLimitsRadians: JointLimits };
+
+const toRadians = (angle: number, assumeDegrees?: boolean) => {
+  const TWO_PI = Math.PI * 2;
+  if (assumeDegrees) return (angle * Math.PI) / 180;
+  // 휴리스틱: 2π보다 크면 deg라고 가정
+  if (Math.abs(angle) > TWO_PI + 1e-3) return (angle * Math.PI) / 180;
+  return angle;
+};
+
+const readUrdfMetaFromViewer = (viewer: any): UrdfMeta | null => {
+  const joints = viewer?.robot?.joints;
+  if (!joints || typeof joints !== "object") return null;
+
+  const names = Object.keys(joints);
+  const jointLimitsRadians: JointLimits = {};
+
+  for (const name of names) {
+    const j = joints[name];
+    const lim = j?.limit ?? j?.limits ?? null;
+
+    const lower =
+      (typeof lim?.lower === "number" ? lim.lower : undefined) ??
+      (typeof lim?.min === "number" ? lim.min : undefined);
+
+    const upper =
+      (typeof lim?.upper === "number" ? lim.upper : undefined) ??
+      (typeof lim?.max === "number" ? lim.max : undefined);
+
+    if (typeof lower === "number" || typeof upper === "number") {
+      jointLimitsRadians[name] = { lower, upper };
+    }
+  }
+
+  return { availableJoints: names, jointLimitsRadians };
+};
+
+const exposeUrdfMetaToWindow = (viewer: any) => {
+  if (typeof window === "undefined") return;
+  const meta = readUrdfMetaFromViewer(viewer);
+  if (!meta) return;
+
+  (window as any).__URDF_JOINTS__ = meta.availableJoints;
+  (window as any).__URDF_JOINT_LIMITS__ = meta.jointLimitsRadians;
+
+  // 디버깅용 (원하면)
+  (window as any).__URDF_VIEWER__ = viewer;
+};
+
+const getJointValue = (viewer: any, jointName: string): number => {
+  const j = viewer?.robot?.joints?.[jointName];
+  const v = j?.jointValue ?? j?.angle ?? j?.value;
+  return typeof v === "number" ? v : 0;
+};
+
+const clampToJointLimits = (viewer: any, jointName: string, angleRad: number): number => {
+  const j = viewer?.robot?.joints?.[jointName];
+  const lim = j?.limit ?? j?.limits ?? null;
+
+  const lower =
+    (typeof lim?.lower === "number" ? lim.lower : undefined) ??
+    (typeof lim?.min === "number" ? lim.min : undefined);
+
+  const upper =
+    (typeof lim?.upper === "number" ? lim.upper : undefined) ??
+    (typeof lim?.max === "number" ? lim.max : undefined);
+
+  let out = angleRad;
+  if (typeof lower === "number" && out < lower) out = lower;
+  if (typeof upper === "number" && out > upper) out = upper;
+  return out;
+};
+
+// --------------------
+// Robust joint resolver (exact/normalized/includes/similarity + ambiguous 방지)
+// --------------------
+const normKey = (s: string) =>
+  s
+    .toLowerCase()
+    .replace(/\.|-/g, "_")
+    .replace(/\s+/g, "_")
+    .replace(/__+/g, "_")
+    .replace(/(^_+|_+$)/g, "")
+    .replace(/(joint|jnt)$/g, "")
+    .replace(/_joint$/g, "");
+
+const tokens = (s: string) =>
+  normKey(s)
+    .split("_")
+    .filter(Boolean)
+    .map((t) => {
+      if (t === "left") return "l";
+      if (t === "right") return "r";
+      return t;
+    });
+
+const tokenSim = (a: string, b: string) => {
+  const A = new Set(tokens(a));
+  const B = new Set(tokens(b));
+  if (!A.size || !B.size) return 0;
+
+  let inter = 0;
+  for (const x of A) if (B.has(x)) inter++;
+  const union = A.size + B.size - inter;
+  return union ? inter / union : 0;
+};
+
+const levenshtein = (a: string, b: string) => {
+  const s = normKey(a);
+  const t = normKey(b);
+  const n = s.length;
+  const m = t.length;
+  if (!n) return m;
+  if (!m) return n;
+
+  const dp = new Array(m + 1).fill(0).map((_, j) => j);
+  for (let i = 1; i <= n; i++) {
+    let prev = dp[0];
+    dp[0] = i;
+    for (let j = 1; j <= m; j++) {
+      const tmp = dp[j];
+      const cost = s[i - 1] === t[j - 1] ? 0 : 1;
+      dp[j] = Math.min(dp[j] + 1, dp[j - 1] + 1, prev + cost);
+      prev = tmp;
+    }
+  }
+  return dp[m];
+};
+
+const editSim = (a: string, b: string) => {
+  const s = normKey(a);
+  const t = normKey(b);
+  const dist = levenshtein(s, t);
+  const maxLen = Math.max(s.length, t.length) || 1;
+  return 1 - dist / maxLen;
+};
+
+type ResolveInfo = {
+  joint: string | null;
+  confidence: number; // 0~1
+  reason: string;
+  candidates?: Array<{ name: string; score: number }>;
+};
+
+const resolveJointTarget = (
+  viewer: any,
+  requested: string,
+  map?: Record<string, string>,
+): ResolveInfo => {
+  const joints = viewer?.robot?.joints;
+  if (!joints) return { joint: null, confidence: 0, reason: "no-joints" };
+
+  const keys = Object.keys(joints);
+  if (!keys.length) return { joint: null, confidence: 0, reason: "no-keys" };
+
+  const reqRaw = requested ?? "";
+  const reqNorm = normKey(reqRaw);
+
+  // 0) explicit map
+  const mapped =
+    (map?.[reqRaw] ??
+      map?.[reqRaw.toLowerCase()] ??
+      map?.[reqNorm] ??
+      null) ?? reqRaw;
+
+  if (joints[mapped]) {
+    return { joint: mapped, confidence: map ? 1 : 1, reason: map ? "explicit-map" : "exact" };
+  }
+
+  const mappedNorm = normKey(mapped);
+
+  // 1) normalized exact
+  const nExact = keys.find((k) => normKey(k) === mappedNorm);
+  if (nExact) return { joint: nExact, confidence: 0.98, reason: "normalized-exact" };
+
+  // 2) includes
+  const partial = keys.find((k) => {
+    const kn = normKey(k);
+    return kn.includes(mappedNorm) || mappedNorm.includes(kn);
+  });
+  if (partial) return { joint: partial, confidence: 0.85, reason: "includes" };
+
+  // 3) similarity scoring
+  const scored = keys
+    .map((name) => {
+      const s1 = tokenSim(mapped, name);
+      const s2 = editSim(mapped, name);
+      const score = 0.6 * s1 + 0.4 * s2;
+      return { name, score };
+    })
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 5);
+
+  const best = scored[0];
+  if (!best) return { joint: null, confidence: 0, reason: "no-candidates" };
+
+  const threshold = 0.78;
+  if (best.score < threshold) {
+    return {
+      joint: null,
+      confidence: best.score,
+      reason: "below-threshold",
+      candidates: scored,
+    };
+  }
+
+  // ambiguous 방지: 1,2등 점수 차이가 너무 작으면 매칭 거부
+  const second = scored[1];
+  if (second && Math.abs(best.score - second.score) < 0.03) {
+    return {
+      joint: null,
+      confidence: best.score,
+      reason: "ambiguous",
+      candidates: scored,
+    };
+  }
+
+  return {
+    joint: best.name,
+    confidence: best.score,
+    reason: "similarity",
+    candidates: scored,
+  };
+};
+
+// ============================================================================
 
 const UrdfViewer: React.FC = () => {
   const [highlightedJoint, setHighlightedJoint] = useState<string | null>(null);
@@ -64,81 +300,200 @@ const UrdfViewer: React.FC = () => {
   const viewerRef = useRef<URDFViewerElement | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
-  // Add state for custom URDF path
   const [customUrdfPath, setCustomUrdfPath] = useState<string | null>(null);
-  const [urlModifierFunc, setUrlModifierFunc] = useState<
-    ((url: string) => string) | null
-  >(null);
 
-  // Implement UrdfProcessor interface for drag and drop
+  // ✅ 함수를 객체로 감싸서 저장
+  const [urlModifierFunc, setUrlModifierFunc] = useState<{
+    func: ((url: string) => string) | null;
+  }>({ func: null });
+
+  // ============================================================================
+  // Motion Animation State
+  // ============================================================================
+  const pendingMoveRef = useRef<MoveJointsDetail | null>(null);
+  const rafRef = useRef<number | null>(null);
+
+  // ============================================================================
+  // Motion Application Function
+  // ============================================================================
+  const applyMotionsToViewer = (viewer: any, motions: MoveJointMotion[], options?: MoveJointsOptions) => {
+    if (!viewer || typeof viewer.setJointValue !== "function") return;
+    if (!Array.isArray(motions) || motions.length === 0) return;
+
+    // 모델 로드 후 meta 노출 (ChatWidget에서 /api/plan context로 쓰게)
+    exposeUrdfMetaToWindow(viewer);
+
+    if (rafRef.current) {
+      cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+    }
+
+    const animate = options?.animate ?? true;
+    const defaultDurationMs = options?.defaultDurationMs ?? 350;
+    const assumeDegrees = options?.assumeDegrees ?? false;
+    const jointNameMap = options?.jointNameMap ?? {};
+
+    const jointKeys = Object.keys(viewer?.robot?.joints ?? {});
+    (window as any).__URDF_JOINTS__ = jointKeys;
+
+    const items: Array<{ joint: string; from: number; to: number; durationMs: number }> = [];
+
+    for (const m of motions) {
+      const res = resolveJointTarget(viewer, m.joint, jointNameMap);
+      if (!res.joint) {
+        console.warn(`[UrdfViewer] joint resolve failed: "${m.joint}" (${res.reason}, conf=${res.confidence.toFixed(2)})`);
+        if (res.candidates?.length) console.warn("[UrdfViewer] candidates:", res.candidates);
+        continue;
+      }
+
+      const raw = typeof m.time === "number" && m.time > 0 ? m.time : defaultDurationMs;
+      // 기존 휴리스틱 유지: 20 미만이면 seconds로 보고 ms로 변환
+      const durationMs = raw < 20 ? raw * 1000 : raw;
+
+      let to = toRadians(m.angle, assumeDegrees);
+      to = clampToJointLimits(viewer, res.joint, to);
+
+      items.push({
+        joint: res.joint,
+        from: getJointValue(viewer, res.joint),
+        to,
+        durationMs,
+      });
+    }
+
+    if (!items.length) return;
+
+    if (!animate) {
+      for (const it of items) viewer.setJointValue(it.joint, it.to);
+      viewer.redraw?.();
+      return;
+    }
+
+    const start = performance.now();
+
+    const tick = (now: number) => {
+      let running = false;
+
+      for (const it of items) {
+        const t = Math.min(1, (now - start) / it.durationMs);
+        const value = it.from + (it.to - it.from) * t;
+        viewer.setJointValue(it.joint, value);
+        if (t < 1) running = true;
+      }
+
+      viewer.redraw?.();
+
+      if (running) {
+        rafRef.current = requestAnimationFrame(tick);
+      } else {
+        rafRef.current = null;
+      }
+    };
+
+    rafRef.current = requestAnimationFrame(tick);
+  };
+
+  // ============================================================================
+  // Event Listener for robot:moveJoints
+  // ============================================================================
+  useEffect(() => {
+    const handler = (evt: Event) => {
+      const raw = (evt as CustomEvent).detail as any;
+
+      const detail: MoveJointsDetail | null =
+        raw && Array.isArray(raw.motions) ? raw : null;
+
+      if (!detail?.motions?.length) return;
+
+      const viewer = viewerRef.current as any;
+
+      if (!viewer?.robot) {
+        pendingMoveRef.current = detail;
+        console.info("[UrdfViewer] viewer not ready yet. queued motions.");
+        return;
+      }
+
+      applyMotionsToViewer(viewer, detail.motions, detail.options);
+    };
+
+    window.addEventListener("robot:moveJoints", handler as EventListener);
+
+    return () => {
+      window.removeEventListener("robot:moveJoints", handler as EventListener);
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+    };
+  }, []);
+
+  // ============================================================================
+  // URDF Processor
+  // ============================================================================
   const urdfProcessor = useMemo(
     () => ({
       loadUrdf: (urdfPath: string) => {
         setCustomUrdfPath(urdfPath);
       },
       setUrlModifierFunc: (func: (url: string) => string) => {
-        setUrlModifierFunc(() => func);
+        setUrlModifierFunc({ func }); // ✅ 객체로 감싸서 저장
       },
     }),
-    []
+    [],
   );
 
-  // Register the URDF processor
   useEffect(() => {
     registerUrdfProcessor(urdfProcessor);
   }, [registerUrdfProcessor, urdfProcessor]);
 
-  // Create and setup the viewer only once
+  // ============================================================================
+  // Viewer Setup
+  // ============================================================================
   useEffect(() => {
     if (!containerRef.current) return;
 
     const cleanupFunctions: (() => void)[] = [];
 
-    // Register the URDF manipulator first, then setup the viewer
     registerUrdfManipulator().then(() => {
-      // Create and configure the URDF viewer element
       const viewer = createUrdfViewer(containerRef.current!);
       viewerRef.current = viewer;
 
-      // Setup mesh loading function
-      setupMeshLoader(viewer, urlModifierFunc);
+      setupMeshLoader(viewer, urlModifierFunc.func); // ✅ .func 접근
 
-      // Resolve selected robot path (owner/repo)
       let urdfPath = defaultUrdfPath;
       if (examples && activeRobotOwner && activeRobotName) {
         const match = examples.find(
-          (ex) =>
-            ex.owner === activeRobotOwner && ex.repo_name === activeRobotName
+          (ex) => ex.owner === activeRobotOwner && ex.repo_name === activeRobotName,
         );
         if (match?.fileType === "URDF" && match.path) {
           urdfPath = match.path;
         }
       }
 
-      // Setup model loading if a path is available
       if (urdfPath) {
         setupModelLoading(viewer, urdfPath);
       }
 
       const onModelProcessed = async () => {
-        // Fit robot to view after it's loaded
         if (viewerRef.current) {
           fitRobotToView(viewerRef.current);
-          
-          // Setup joint limits enforcement
+
           try {
             await setupJointLimits(viewerRef.current, urdfPath);
           } catch (error) {
             console.warn("Failed to setup joint limits:", error);
           }
+
+          // ✅ URDF meta 노출 (Planner context / 디버깅용)
+          exposeUrdfMetaToWindow(viewerRef.current);
+
+          const pending = pendingMoveRef.current;
+          if (pending && viewerRef.current) {
+            applyMotionsToViewer(viewerRef.current as any, pending.motions, pending.options);
+            pendingMoveRef.current = null;
+          }
         }
       };
 
-      // Setup joint highlighting
-      const cleanupJointHighlighting = setupJointHighlighting(
-        viewer,
-        setHighlightedJoint
-      );
+      const cleanupJointHighlighting = setupJointHighlighting(viewer, setHighlightedJoint);
       cleanupFunctions.push(cleanupJointHighlighting);
 
       viewer.addEventListener("urdf-processed", onModelProcessed);
@@ -147,43 +502,35 @@ const UrdfViewer: React.FC = () => {
       });
     });
 
-    // Return cleanup function
     return () => {
       cleanupFunctions.forEach((cleanup) => cleanup());
     };
   }, [urlModifierFunc, examples, activeRobotOwner, activeRobotName]);
 
-  // Function to fit the robot to the camera view
+  // ============================================================================
+  // Fit Robot to View
+  // ============================================================================
   const fitRobotToView = (viewer: URDFViewerElement) => {
     if (!viewer || !viewer.robot) {
       return;
     }
 
     try {
-      // Create a bounding box for the robot
       const boundingBox = new THREE.Box3().setFromObject(viewer.robot);
-
-      // Calculate the center of the bounding box
       const center = new THREE.Vector3();
       boundingBox.getCenter(center);
 
-      // Calculate the size of the bounding box
       const size = new THREE.Vector3();
       boundingBox.getSize(size);
 
-      // Get the maximum dimension to ensure the entire robot is visible
       const maxDim = Math.max(size.x, size.y, size.z);
 
-      // Isometric position along (1,1,1)
       const isoDirection = new THREE.Vector3(1, 1, 1).normalize();
-      const distance = maxDim * 1.8; // padding factor for URDF
-      const position = center
-        .clone()
-        .add(isoDirection.multiplyScalar(distance));
+      const distance = maxDim * 1.8;
+      const position = center.clone().add(isoDirection.multiplyScalar(distance));
       viewer.camera.position.copy(position);
       viewer.controls.target.copy(center);
 
-      // Update controls and mark for redraw
       viewer.controls.update();
       viewer.redraw();
     } catch (error) {
@@ -191,132 +538,121 @@ const UrdfViewer: React.FC = () => {
     }
   };
 
-  // Effect to handle robot selection changes
+  // ============================================================================
+  // Robot Selection Change
+  // ============================================================================
   useEffect(() => {
     if (!viewerRef.current) return;
     if (!examples || !activeRobotOwner || !activeRobotName) return;
+
     const match = examples.find(
-      (ex) => ex.owner === activeRobotOwner && ex.repo_name === activeRobotName
+      (ex) => ex.owner === activeRobotOwner && ex.repo_name === activeRobotName,
     );
     if (!match || match.fileType !== "URDF" || !match.path) return;
+
     const urdfPath = match.path;
 
-    // Clear the current robot by removing the urdf attribute first
     viewerRef.current.removeAttribute("urdf");
 
-    // Small delay to ensure the attribute is cleared
     setTimeout(() => {
       if (viewerRef.current) {
-        // Update the mesh loader first to ensure it's ready for the new URDF
-        setupMeshLoader(viewerRef.current, urlModifierFunc);
+        setupMeshLoader(viewerRef.current, urlModifierFunc.func);
 
-        // Add a one-time event listener to confirm the URDF is processed
         const onUrdfProcessed = async () => {
-          // Fit robot to view after it's loaded
           if (viewerRef.current) {
             fitRobotToView(viewerRef.current);
-            
-            // Setup joint limits enforcement
+
             try {
               await setupJointLimits(viewerRef.current, urdfPath);
             } catch (error) {
               console.warn("Failed to setup joint limits:", error);
             }
+
+            // ✅ meta 노출
+            exposeUrdfMetaToWindow(viewerRef.current);
+
+            const pending = pendingMoveRef.current;
+            if (pending && viewerRef.current) {
+              applyMotionsToViewer(viewerRef.current as any, pending.motions, pending.options);
+              pendingMoveRef.current = null;
+            }
           }
 
-          viewerRef.current?.removeEventListener(
-            "urdf-processed",
-            onUrdfProcessed
-          );
+          viewerRef.current?.removeEventListener("urdf-processed", onUrdfProcessed);
         };
 
         viewerRef.current.addEventListener("urdf-processed", onUrdfProcessed);
 
         viewerRef.current.setAttribute("urdf", urdfPath);
-        // viewerRef.current.setAttribute("package", "");
 
-        // Force a redraw
-        if (viewerRef.current.redraw) {
-          viewerRef.current.redraw();
-        }
+        viewerRef.current.redraw?.();
       }
     }, 100);
   }, [examples, activeRobotOwner, activeRobotName, urlModifierFunc]);
 
-  // Effect to update the viewer when a new robot is dropped
+  // ============================================================================
+  // Custom URDF Drop
+  // ============================================================================
   useEffect(() => {
     if (!viewerRef.current || !customUrdfPath) return;
 
-    // Update the viewer with the new URDF
     const loadPath =
       customUrdfPath.startsWith("blob:") && !customUrdfPath.includes("#.")
         ? customUrdfPath + "#.urdf"
         : customUrdfPath;
 
-    // Clear the current robot by removing the urdf attribute first
     viewerRef.current.removeAttribute("urdf");
 
-    // Small delay to ensure the attribute is cleared
     setTimeout(() => {
       if (viewerRef.current) {
-        // Update the mesh loader first to ensure it's ready for the new URDF
-        setupMeshLoader(viewerRef.current, urlModifierFunc);
+        setupMeshLoader(viewerRef.current, urlModifierFunc.func);
 
-        // Add a one-time event listener to confirm the URDF is processed
         const onUrdfProcessed = async () => {
-          // Fit robot to view after it's loaded
           if (viewerRef.current) {
             fitRobotToView(viewerRef.current);
-            
-            // Setup joint limits enforcement
+
             try {
               await setupJointLimits(viewerRef.current, loadPath);
             } catch (error) {
               console.warn("Failed to setup joint limits:", error);
             }
+
+            // ✅ meta 노출
+            exposeUrdfMetaToWindow(viewerRef.current);
+
+            const pending = pendingMoveRef.current;
+            if (pending && viewerRef.current) {
+              applyMotionsToViewer(viewerRef.current as any, pending.motions, pending.options);
+              pendingMoveRef.current = null;
+            }
           }
 
-          viewerRef.current?.removeEventListener(
-            "urdf-processed",
-            onUrdfProcessed
-          );
+          viewerRef.current?.removeEventListener("urdf-processed", onUrdfProcessed);
         };
 
         viewerRef.current.addEventListener("urdf-processed", onUrdfProcessed);
 
         viewerRef.current.setAttribute("urdf", loadPath);
-        // viewerRef.current.setAttribute("package", "");
 
-        // Force a redraw
-        if (viewerRef.current.redraw) {
-          viewerRef.current.redraw();
-        }
+        viewerRef.current.redraw?.();
       }
     }, 100);
   }, [customUrdfPath, urlModifierFunc]);
 
-  // Effect to update mesh loader when URL modifier function changes
+  // ============================================================================
+  // URL Modifier Update
+  // ============================================================================
   useEffect(() => {
     if (!viewerRef.current) return;
-
-    setupMeshLoader(viewerRef.current, urlModifierFunc);
+    setupMeshLoader(viewerRef.current, urlModifierFunc.func);
   }, [urlModifierFunc]);
 
   return (
-    <div
-      className={cn(
-        "w-full h-full transition-all duration-300 ease-in-out relative rounded-xl"
-      )}
-    >
+    <div className={cn("w-full h-full transition-all duration-300 ease-in-out relative rounded-xl")}>
       <div ref={containerRef} className="w-full h-full absolute inset-0" />
 
-      {/* Joint highlight indicator */}
       {highlightedJoint && (
-        <div
-          className={
-            "font-mono absolute bottom-4 right-4 text-[#9b8632] px-3 py-2 rounded-md text-sm z-10 flex items-center gap-2"
-          }
-        >
+        <div className="font-mono absolute bottom-4 right-4 text-[#9b8632] px-3 py-2 rounded-md text-sm z-10 flex items-center gap-2">
           <svg
             xmlns="http://www.w3.org/2000/svg"
             width="17"
