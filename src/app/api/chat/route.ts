@@ -1,3 +1,4 @@
+// src/app/api/chat/route.ts
 import { NextResponse } from "next/server";
 
 import { Prompter } from "@/llm/prompter";
@@ -37,10 +38,7 @@ export async function POST(request: Request) {
     const { message, history } = body ?? {};
 
     if (typeof message !== "string" || !message.trim()) {
-      return NextResponse.json(
-        { error: "메시지를 입력해주세요." },
-        { status: 400 },
-      );
+      return NextResponse.json({ error: "메시지를 입력해주세요." }, { status: 400 });
     }
 
     const userTurn: ChatTurn = { role: "user", content: message.trim() };
@@ -52,16 +50,23 @@ export async function POST(request: Request) {
   } catch (error: unknown) {
     console.error("[chat route]", error);
 
-    const message =
+    const msg =
       error instanceof Error
         ? error.message
-        : typeof error === "object" && error && "message" in error && typeof (error as { message: unknown }).message === "string"
-          ? (error as { message: string }).message
+        : typeof error === "object" && error && "message" in error && typeof (error as any).message === "string"
+          ? String((error as any).message)
           : "";
 
-    if (message.includes("API key")) {
+    const lower = msg.toLowerCase();
+    const missingKey =
+      lower.includes("openai_api_key") ||
+      lower.includes("missing required environment variable") ||
+      lower.includes("missing credentials") ||
+      lower.includes("api key");
+
+    if (missingKey) {
       return NextResponse.json(
-        { error: "OPENAI_API_KEY가 설정되지 않았습니다. keys.json 파일이나 환경 변수를 확인하세요." },
+        { error: "OPENAI_API_KEY가 설정되지 않았습니다. 환경 변수(.env.local 포함)를 확인하세요." },
         { status: 500 },
       );
     }
