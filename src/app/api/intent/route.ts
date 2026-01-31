@@ -12,7 +12,7 @@ import { getModelForStage, shouldDebugModels } from "@/server/llm/modelConfig";
 function isLegacyGpt5(modelName: string) {
   const m = modelName.toLowerCase();
   if (!m.startsWith("gpt-5")) return false;
-  // gpt-5.1 / gpt-5.2는 별도 규칙이 있을 수 있으니 여기선 “구형 GPT-5 계열”만 잡는다.
+  // gpt-5.1 / gpt-5.2는 별도 규칙이 있을 수 있으니 여기선 "구형 GPT-5 계열"만 잡는다.
   return !(m.startsWith("gpt-5.1") || m.startsWith("gpt-5.2"));
 }
 
@@ -50,6 +50,7 @@ Return ONLY a json object with this shape:
 }
 
 Rules:
+- If the user requests reinforcement learning / RL / policy training / "강화학습" / "강화 학습" / "걷는걸 학습" / similar phrases, set intent.goal **exactly** to "start_reinforcement_learning" (do not translate or paraphrase this canonical string).
 - NEVER include "motions".
 - JSON only. No extra keys.
 - If info is missing, still output a safe, conservative intent.
@@ -80,6 +81,98 @@ type IntentResponse = {
 };
 
 const MAX_HISTORY = 12;
+
+const RL_CANONICAL_GOAL = "start_reinforcement_learning";
+const RL_GOAL_SYNONYMS = new Set(
+  [
+    "start_reinforcement_learning",
+    "start_reinforcement_learning_for_human",
+    "start_reinforcement_learning_for_humanoid",
+    "start_reinforcement_learning_for_mujoco",
+    "start_reinforcement_learning_session",
+    "startreinforcementlearning",
+  ].map((value) => value.toLowerCase()),
+);
+
+const RL_GOAL_REGEXES: RegExp[] = [
+  /start\s*(a|the)?\s*reinforcement[-\s]?learning/i,
+  /(reinforcement[-\s]?learning|강화\s*학습).{0,40}(start|시작|실행|launch|train|훈련|학습)/i,
+  /(start|run|train|launch|execute).{0,40}(reinforcement[-\s]?learning|강화\s*학습)/i,
+  /(reinforcement[-\s]?learning|강화\s*학습).{0,40}(walk|walking|gait|locomotion|보행|걷)/i,
+  /(walk|walking|gait|locomotion|보행|걷).{0,40}(reinforcement[-\s]?learning|강화\s*학습)/i,
+];
+
+const RL_MESSAGE_PATTERNS: RegExp[] = [
+  /강화\s*학습.{0,40}(걷|보행|워킹|walking|walk|gait|locomotion).{0,40}(해줘|해주세요|해줘요|시작|실행|훈련|학습|만들어|시키|run|train|start|execute|launch)/i,
+  /(걷|보행|워킹|walking|walk|gait|locomotion).{0,40}강화\s*학습.{0,40}(해줘|해주세요|해줘요|시작|실행|훈련|학습|만들어|시키|run|train|start|execute|launch)/i,
+  /(reinforcement[-\s]?learning|rl).{0,40}(walk|walking|gait|locomotion).{0,40}(start|run|train|training|execute|launch|kick\s*off|please)/i,
+  /(reinforcement[-\s]?learning|강화\s*학습).{0,40}(walk|walking|gait|locomotion|걷|보행|워킹).{0,40}(하고\s*싶|하고싶|싶어|원해|원합니다|하고자)/i,
+];
+
+const RL_NEGATIVE_PATTERNS: RegExp[] = [
+  /설명/, /알려줘/, /알려\s*줘/, /가르쳐/, /가르쳐\s*줘/, /무엇/, /뭐야/, /뭔지/, /예시/, /방법/,
+  /어떻게/, /왜/, /궁금/, /가능해/, /가능할까/, /가능할까요/, /가능할까\?/,
+];
+
+const RL_COMMAND_PATTERNS: RegExp[] = [
+  /(시작|실행|돌려|켜|훈련|학습|만들어|가동|운영).{0,4}해(?:줘|줘요|주세요|줘라)?/,
+  /(run|start|launch|execute|train|training|initiate|kick\s*off).{0,20}(it|this|rl|policy|session|training)/i,
+  /(make|teach).{0,20}(it|the|robot).{0,20}(walk|gait)/i,
+  /(start|run|launch|execute).{0,20}(reinforcement[-\s]?learning|rl)/i,
+  /(reinforcement[-\s]?learning|강화\s*학습).{0,20}(시작|실행|훈련|학습|만들|돌려|켜)/i,
+];
+
+const RL_DESIRE_PATTERNS: RegExp[] = [
+  /(하고\s*싶|하고싶|하고자|싶어|싶다|싶습니다|원해|원합니다|하고\s*싶습니다)/,
+  /(i\s*want|i'd\s*like|i\s*would\s*like|i\s*want\s*to)\s*(start|run|train|learn)/i,
+];
+
+function messageImpliesWalkingRlTraining(userMessage: string): boolean {
+  if (!userMessage) return false;
+  const normalized = userMessage.toLowerCase();
+
+  const hasRlCue = RL_MESSAGE_PATTERNS.some((regex) => regex.test(normalized));
+  if (!hasRlCue) return false;
+
+  const hasNegative = RL_NEGATIVE_PATTERNS.some((regex) => regex.test(normalized));
+  const hasCommand = RL_COMMAND_PATTERNS.some((regex) => regex.test(normalized));
+  const hasDesire = RL_DESIRE_PATTERNS.some((regex) => regex.test(normalized));
+
+  if (!hasCommand && !hasDesire) {
+    return false;
+  }
+
+  if (hasNegative && !hasCommand) {
+    return false;
+  }
+
+  return true;
+}
+
+function normalizeIntentGoal(goal: string, userMessage: string): string {
+  const trimmed = goal.trim();
+  if (!trimmed) return goal;
+
+  const lower = trimmed.toLowerCase();
+  if (RL_GOAL_SYNONYMS.has(lower)) {
+    return RL_CANONICAL_GOAL;
+  }
+
+  const collapsed = lower.replace(/\s+/g, "");
+  if (RL_GOAL_SYNONYMS.has(collapsed)) {
+    return RL_CANONICAL_GOAL;
+  }
+
+  if (RL_GOAL_REGEXES.some((regex) => regex.test(trimmed))) {
+    return RL_CANONICAL_GOAL;
+  }
+
+  if (messageImpliesWalkingRlTraining(userMessage)) {
+    return RL_CANONICAL_GOAL;
+  }
+
+  return goal;
+}
 
 function sanitizeHistory(entries: unknown): ChatTurn[] {
   if (!Array.isArray(entries)) return [];
@@ -169,7 +262,7 @@ export async function POST(request: Request) {
     }
 
     parsed.text = parsed.text.trim();
-    parsed.intent.goal = parsed.intent.goal.trim();
+    parsed.intent.goal = normalizeIntentGoal(parsed.intent.goal, message).trim();
 
     return NextResponse.json(parsed);
   } catch (error: unknown) {
