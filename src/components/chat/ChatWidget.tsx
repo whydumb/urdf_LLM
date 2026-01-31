@@ -1,7 +1,6 @@
-// src/components/chat/ChatWidget.tsx
 "use client";
 
-import { FormEvent, useState } from "react";
+import { FormEvent, useEffect, useRef, useState } from "react";
 import { ChevronDown, Loader2, Mic, Plus, Sparkles } from "lucide-react";
 
 type ConversationMessage = {
@@ -48,11 +47,48 @@ type ExecuteResponse = {
   error?: string;
 };
 
+type RLTrainingSummary = {
+  when: string;
+  policyLabel: string;
+  episodes: number;
+  bestReturn: number;
+  lastReturn: number | null;
+  actionDim: number;
+  obsDim: number;
+  frameSkip: number;
+  maxSteps: number;
+  baseBodyId?: number | null;
+  targetHeight?: number | null;
+  termReasonCounts?: Record<string, number>;
+};
+
+type TaskPlannerResponse = {
+  text: string;
+  plan: {
+    goal: string;
+    rlConfig?: {
+      reward?: Record<string, number>;
+      terminate?: Record<string, number>;
+      frameSkip?: number;
+      maxSteps?: number;
+      actionMode?: "normalized" | "direct";
+    };
+    actionHint?: {
+      kind: "sine";
+      amp?: number;
+      speed?: number;
+      bias?: number[];
+      scale?: number[];
+      phase?: number[];
+    };
+  };
+  error?: string;
+};
+
 type JointLimits = Record<string, { lower?: number; upper?: number }>;
 type UrdfMeta = { availableJoints: string[]; jointLimitsRadians: JointLimits };
 
 const EMPTY_HINT = "LLM 답변은 이 자리에서 바로 확인할 수 있어요.";
-
 const DEFAULT_JOINT_NAME_MAP: Record<string, string> = {};
 
 const normalizeJointKey = (s: string) =>
@@ -157,12 +193,11 @@ function buildPlannerContext(meta: UrdfMeta | null): string | undefined {
   ].join("\n");
 }
 
-type Stage = "intent" | "motor" | "execute";
+type Stage = "intent" | "motor" | "execute" | "task_planner";
 type Phase = "start" | "end";
 
 function estTok(chars: number) {
   if (!Number.isFinite(chars) || chars <= 0) return 0;
-  // 터미널 HUD용 대충 추정치(정확 토큰은 아님)
   return Math.max(1, Math.round(chars / 4));
 }
 
@@ -184,8 +219,103 @@ export default function ChatWidget() {
   const [message, setMessage] = useState("");
   const [messages, setMessages] = useState<ConversationMessage[]>([]);
   const [isLoading, setIsLoading] = useState(false);
+  const [plannerLoading, setPlannerLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const messagesRef = useRef<ConversationMessage[]>([]);
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
+
+  // RL training end -> planner
+  useEffect(() => {
+    const onTrainingSummary = (ev: Event) => {
+      const summary = (ev as CustomEvent<RLTrainingSummary>).detail;
+      void runTaskPlanner(summary);
+    };
+
+    window.addEventListener("rl:trainingSummary", onTrainingSummary as any);
+    return () => window.removeEventListener("rl:trainingSummary", onTrainingSummary as any);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  async function runTaskPlanner(summary: RLTrainingSummary) {
+    try {
+      setPlannerLoading(true);
+
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: crypto.randomUUID(),
+          role: "assistant",
+          content: `학습 종료 요약 수신 (best=${summary.bestReturn.toFixed(2)}, eps=${summary.episodes}). 다음 목표를 계획중…`,
+        },
+      ]);
+
+      const urdfMeta = getUrdfMetaFromWindowOrDom();
+      const context = buildPlannerContext(urdfMeta);
+
+      const historyPayload = messagesRef.current.map(({ role, content }) => ({ role, content }));
+
+      const reqBody = {
+        summary,
+        history: historyPayload,
+        context,
+      };
+
+      const inChars = JSON.stringify(reqBody).length;
+      emitAiStage({ stage: "task_planner", phase: "start", inChars, inTok: estTok(inChars) });
+
+      const t0 = performance.now();
+      const resp = await fetch("/api/task-planner", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(reqBody),
+      });
+
+      const data = (await resp.json()) as TaskPlannerResponse;
+      const ms = Math.round(performance.now() - t0);
+      const outChars = JSON.stringify(data).length;
+
+      emitAiStage({
+        stage: "task_planner",
+        phase: "end",
+        ok: resp.ok,
+        ms,
+        inChars,
+        outChars,
+        inTok: estTok(inChars),
+        outTok: estTok(outChars),
+      });
+
+      if (!resp.ok) throw new Error(data?.error || "task-planner 실패");
+
+      if (data?.text?.trim()) {
+        setMessages((prev) => [
+          ...prev,
+          { id: crypto.randomUUID(), role: "assistant", content: data.text.trim() },
+        ]);
+      }
+
+      if (data?.plan) {
+        window.dispatchEvent(new CustomEvent("rl:applyPlan", { detail: data.plan }));
+      }
+    } catch (e) {
+      console.error("[task-planner] error:", e);
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: crypto.randomUUID(),
+          role: "assistant",
+          content: `task-planner 오류: ${e instanceof Error ? e.message : String(e)}`,
+        },
+      ]);
+    } finally {
+      setPlannerLoading(false);
+    }
+  }
+
+  // chat submit (intent/motor/execute)
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
 
@@ -209,51 +339,36 @@ export default function ChatWidget() {
       const urdfMeta = getUrdfMetaFromWindowOrDom();
       const context = buildPlannerContext(urdfMeta);
 
-      // ================================
       // 1) intent
-      // ================================
-      const intentReqBody = {
-        message: trimmed,
-        history: historyPayload,
-        context,
-      };
+      const intentReqBody = { message: trimmed, history: historyPayload, context };
       const intentInChars = JSON.stringify(intentReqBody).length;
-      emitAiStage({ stage: "intent", phase: "start", inChars: intentInChars, inTok: estTok(intentInChars) });
+      emitAiStage({
+        stage: "intent",
+        phase: "start",
+        inChars: intentInChars,
+        inTok: estTok(intentInChars),
+      });
 
       const tIntent = performance.now();
-      let intentResp: Response;
-      let intentData: IntentResponse;
-
-      try {
-        intentResp = await fetch("/api/intent", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(intentReqBody),
-        });
-
-        intentData = (await intentResp.json()) as IntentResponse;
-      } catch (e) {
-        emitAiStage({ stage: "intent", phase: "end", ok: false, ms: Math.round(performance.now() - tIntent) });
-        throw e;
-      }
-
-      const intentMs = Math.round(performance.now() - tIntent);
-      const intentOutChars = JSON.stringify(intentData).length;
+      const intentResp = await fetch("/api/intent", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(intentReqBody),
+      });
+      const intentData = (await intentResp.json()) as IntentResponse;
 
       emitAiStage({
         stage: "intent",
         phase: "end",
         ok: intentResp.ok,
-        ms: intentMs,
+        ms: Math.round(performance.now() - tIntent),
         inChars: intentInChars,
-        outChars: intentOutChars,
+        outChars: JSON.stringify(intentData).length,
         inTok: estTok(intentInChars),
-        outTok: estTok(intentOutChars),
+        outTok: estTok(JSON.stringify(intentData).length),
       });
 
-      if (!intentResp.ok) {
-        throw new Error(intentData?.error || "명령 해석(intent)에 실패했습니다.");
-      }
+      if (!intentResp.ok) throw new Error(intentData?.error || "명령 해석(intent) 실패");
 
       const displayText = intentData?.text?.trim();
       if (displayText) {
@@ -263,63 +378,83 @@ export default function ChatWidget() {
         ]);
       }
 
-      // ================================
-      // 2) motor
-      // ================================
-      const motorReqBody = {
-        intent: intentData.intent,
-        context,
-        message: trimmed,
-      };
-      const motorInChars = JSON.stringify(motorReqBody).length;
-      emitAiStage({ stage: "motor", phase: "start", inChars: motorInChars, inTok: estTok(motorInChars) });
+      // ✅ RL 시작 명령 체크 (motor로 가기 전에 early return)
+      const goalRaw = intentData?.intent?.goal ?? "";
+      const goal = String(goalRaw).toLowerCase();
 
-      const tMotor = performance.now();
-      let motorResp: Response;
-      let motorData: MotorResponse;
+      const isRLStart =
+        goal === "start_reinforcement_learning" ||
+        goal === "start_reinforcement_learning_for_human" ||
+        goal === "start_reinforcement_learning_for_humanoid" ||
+        goal === "start_reinforcement_learning_for_mujoco" ||
+        goal === "start_reinforcement_learning_session" ||
+        (goal.includes("reinforcement") && goal.includes("learning") && goal.includes("start"));
 
-      try {
-        motorResp = await fetch("/api/motor", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(motorReqBody),
-        });
+      if (isRLStart) {
+        window.dispatchEvent(
+          new CustomEvent("rl:startTraining", {
+            detail: {
+              durationMs: intentData?.intent?.duration_ms ?? 15000,
+            },
+          }),
+        );
 
-        motorData = (await motorResp.json()) as MotorResponse;
-      } catch (e) {
-        emitAiStage({ stage: "motor", phase: "end", ok: false, ms: Math.round(performance.now() - tMotor) });
-        throw e;
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: crypto.randomUUID(),
+            role: "assistant",
+            content: "강화학습 트레이닝을 시작합니다. (MuJoCo RL 모드)",
+          },
+        ]);
+
+        return;
       }
 
-      const motorMs = Math.round(performance.now() - tMotor);
-      const motorOutChars = JSON.stringify(motorData).length;
+      // 2) motor
+      const motorReqBody = { intent: intentData.intent, context, message: trimmed };
+      const motorInChars = JSON.stringify(motorReqBody).length;
+      emitAiStage({
+        stage: "motor",
+        phase: "start",
+        inChars: motorInChars,
+        inTok: estTok(motorInChars),
+      });
+
+      const tMotor = performance.now();
+      const motorResp = await fetch("/api/motor", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(motorReqBody),
+      });
+      const motorData = (await motorResp.json()) as MotorResponse;
 
       emitAiStage({
         stage: "motor",
         phase: "end",
         ok: motorResp.ok,
-        ms: motorMs,
+        ms: Math.round(performance.now() - tMotor),
         inChars: motorInChars,
-        outChars: motorOutChars,
+        outChars: JSON.stringify(motorData).length,
         inTok: estTok(motorInChars),
-        outTok: estTok(motorOutChars),
+        outTok: estTok(JSON.stringify(motorData).length),
       });
 
-      if (!motorResp.ok) {
-        throw new Error(motorData?.error || "모터 모션 생성(motor compile)에 실패했습니다.");
-      }
-
+      if (!motorResp.ok) throw new Error(motorData?.error || "motor compile 실패");
       if (!Array.isArray(motorData?.motions) || motorData.motions.length === 0) {
         throw new Error("motor API가 motions를 반환하지 않았습니다.");
       }
 
-      // ================================
       // 3) execute (async)
-      // ================================
       void (async () => {
         const execReqBody = { motions: motorData.motions, context };
         const execInChars = JSON.stringify(execReqBody).length;
-        emitAiStage({ stage: "execute", phase: "start", inChars: execInChars, inTok: estTok(execInChars) });
+        emitAiStage({
+          stage: "execute",
+          phase: "start",
+          inChars: execInChars,
+          inTok: estTok(execInChars),
+        });
 
         const tExec = performance.now();
         try {
@@ -330,18 +465,16 @@ export default function ChatWidget() {
           });
 
           const execData: ExecuteResponse | null = await execResponse.json().catch(() => null);
-          const execMs = Math.round(performance.now() - tExec);
 
-          const execOutChars = execData ? JSON.stringify(execData).length : 0;
           emitAiStage({
             stage: "execute",
             phase: "end",
             ok: execResponse.ok,
-            ms: execMs,
+            ms: Math.round(performance.now() - tExec),
             inChars: execInChars,
-            outChars: execOutChars,
+            outChars: execData ? JSON.stringify(execData).length : 0,
             inTok: estTok(execInChars),
-            outTok: estTok(execOutChars),
+            outTok: execData ? estTok(JSON.stringify(execData).length) : 0,
           });
 
           if (!execResponse.ok) {
@@ -353,8 +486,6 @@ export default function ChatWidget() {
             Array.isArray(execData?.motions) && execData!.motions!.length > 0
               ? execData!.motions!
               : motorData.motions;
-
-          if (execData?.warnings?.length) console.info("[execute warnings]", execData.warnings);
 
           const latestMeta = getUrdfMetaFromWindowOrDom() ?? urdfMeta;
           const available = latestMeta?.availableJoints ?? [];
@@ -381,12 +512,17 @@ export default function ChatWidget() {
             }),
           );
         } catch (e) {
-          emitAiStage({ stage: "execute", phase: "end", ok: false, ms: Math.round(performance.now() - tExec) });
+          emitAiStage({
+            stage: "execute",
+            phase: "end",
+            ok: false,
+            ms: Math.round(performance.now() - tExec),
+          });
           console.error("[execute] error:", e);
         }
       })();
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "알 수 없는 오류가 발생했어요.";
+      const msg = err instanceof Error ? err.message : "알 수 없는 오류";
       setError(msg);
     } finally {
       setIsLoading(false);
@@ -423,10 +559,10 @@ export default function ChatWidget() {
               ))
             )}
 
-            {isLoading && (
+            {(isLoading || plannerLoading) && (
               <div className="flex items-center gap-2 text-xs text-[#7d7256]">
                 <Loader2 className="h-4 w-4 animate-spin" />
-                생각을 정리하고 있어요…
+                {plannerLoading ? "플래너가 다음 목표를 만드는 중…" : "생각을 정리하고 있어요…"}
               </div>
             )}
           </div>
